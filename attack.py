@@ -29,9 +29,15 @@ class Attack:
         self.max_target_phrase_length = max_target_phrase_length
         self.max_audio_length = max_audio_length
 
-        # Trainable variables
-        self.delta = tf.Variable(tf.zeros(max_audio_length, dtype=tf.float32),
-                                 name='qq_delta')
+        # Variables
+        with tfv1.variable_scope('adv', reuse=tfv1.AUTO_REUSE):
+          self.delta = tf.Variable(tf.zeros(max_audio_length, dtype=tf.float32),
+                                   name='delta')
+          self.rescale = tf.Variable(tf.ones((1,), dtype=tf.float32),
+                                     name='rescale')
+          self.lr = tf.Variable(1e2, shape=(), name='lr')
+
+          self.global_step = tf.Variable(0, dtype=tf.int32, name='global_step')
 
         # Placeholder
         self.mask = tfv1.placeholder(shape=(batch_size, max_audio_length),
@@ -44,8 +50,6 @@ class Attack:
                                             dtype=tf.int32)
         self.target_phrase_length = tfv1.placeholder(shape=(batch_size,),
                                                    dtype=tf.int32)
-        self.rescale = tf.Variable(tf.ones((1,), dtype=tf.float32),
-                                   name='qq_delta')
 
         # Prepare input audios
         apply_delta = tf.clip_by_value(self.delta, -2000, 2000)
@@ -74,30 +78,28 @@ class Attack:
         self.loss = loss
 
         # Optimize step
-        self.lr = tf.Variable(0.0, shape=(), name='qq_lr')
-        global_step = tfv1.train.get_global_step()
         # self.lr = tfv1.train.exponential_decay(
         #     1e-6, global_step=global_step,
         #     decay_steps=10, decay_rate=2)
         self.optimizer = tfv1.train.AdamOptimizer(self.lr)
-        self.train_op = self.optimizer.minimize(-self.loss, global_step=global_step, var_list=[self.delta])
-        tf.summary.scalar("learning_rate", self.lr)
-        tf.summary.scalar("current_step", global_step)
-        tf.summary.scalar("loss", self.loss)
-        # self.optimizer = tfv1.train.AdamOptimizer(learning_rate)
-        # grad, var = self.optimizer.compute_gradients(
-        #     self.loss, [self.delta])[0]
-        # self.train_op = self.optimizer.apply_gradients([(-grad, var)])
+        self.train_pos_op = self.optimizer.minimize(self.loss, global_step=self.global_step, var_list=[self.delta])
+        self.train_neg_op = self.optimizer.minimize(-self.loss, global_step=self.global_step, var_list=[self.delta])
+        
+        self.summary = tfv1.summary.merge([
+          tfv1.summary.scalar("learning_rate", self.lr),
+          tfv1.summary.scalar("loss", tf.math.reduce_mean(self.loss)),
+        ])
 
     def init_sess(self, sess, restore_path=None):
         # And finally restore the graph to make the classifier
         # actually do something interesting.
-        saver = tf.train.Saver(
-            [x for x in tf.global_variables() if 'qq' not in x.name])
+        saver = tfv1.train.Saver(
+          set(tfv1.global_variables()) - set(tfv1.global_variables('adv')))
         saver.restore(sess, restore_path)
 
-        sess.run(tf.variables_initializer(
-            self.optimizer.variables() + [self.delta, self.rescale]))
+        sess.run(tfv1.variables_initializer(
+            self.optimizer.variables() + tf.global_variables('adv')))
+        sess.run(self.global_step.assign(0))
 
     def build_feed_dict(self, audios, lengths, target=None):
         assert audios.shape[0] == self.batch_size
@@ -116,7 +118,9 @@ class Attack:
         }
 
         if target is not None:
-            target = [[toks.index(x) for x in phrase.lower()] for phrase in target]
+            target = [[toks.index(x) for x in phrase.lower()]
+                      + [toks.index('-')] * (self.max_target_phrase_length - len(phrase))
+                      for phrase in target]
             feed_dict = {
                 **feed_dict,
                 self.target_phrase: pad_sequences(target,
@@ -144,9 +148,16 @@ class Attack:
                 for y, l in zip(np.argmax(logits, axis=2).T, feed_dict[self.length])]
         return res, res2
 
-    def train_step(self, sess, feed_dict):
-        loss, _ = sess.run((self.loss, self.train_op),
-                            feed_dict=feed_dict)
+    def train_step(self, sess, feed_dict, minimize_loss=True, summary_writer=None):
+        train_op = self.train_pos_op if minimize_loss else self.train_neg_op
+        res = sess.run((self.global_step,
+                        self.summary,
+                        self.loss,
+                        train_op),
+                       feed_dict=feed_dict)
+        global_step, summary, loss, _ = res
+        if summary_writer is not None:
+            summary_writer.add_summary(summary, global_step)
         return loss
 
     def get_delta(self, sess):
