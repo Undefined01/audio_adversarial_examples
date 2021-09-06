@@ -8,6 +8,7 @@
 import numpy as np
 import tensorflow as tf
 import tensorflow.compat.v1 as tfv1
+import tensorflow.keras as keras
 
 from tensorflow.keras.backend import ctc_label_dense_to_sparse
 from tf_logits import get_logits
@@ -18,7 +19,48 @@ from tf_logits import get_logits
 toks = " abcdefghijklmnopqrstuvwxyz'-"
 
 
+class Conv1DTranspose(keras.layers.Layer):
+    def __init__(self, filters, kernels, strides, activation=None):
+        super().__init__()
+        self.filters = filters
+        self.kernels = kernels
+        self.strides = strides
+        self.activation = activation
+
+    def build(self, input_shape):
+        assert len(input_shape) == 3
+        self.batch_size = input_shape[0]
+        self.depth = input_shape[1]
+        self.in_channels = input_shape[2]
+        self.w = self.add_weight(
+            shape=(self.kernels, self.filters, self.in_channels),
+            initializer="random_normal",
+            trainable=True,
+            dtype=tf.float32,
+        )
+
+    def call(self, inputs):
+        x = tf.nn.conv1d_transpose(
+            input=inputs,
+            filters=self.w,
+            output_shape=(
+                int(self.batch_size),
+                int(self.depth * self.strides),
+                self.filters,
+            ),
+            strides=self.strides,
+        )
+        if self.activation is not None:
+            if self.activation == "sigmoid":
+                x = keras.activations.sigmoid(x)
+            else:
+                raise "Unknown activation {}".format(self.activation)
+        return x
+
+
 class Attack:
+    noise_length = 16000
+
     def __init__(
         self,
         max_audio_length,
@@ -26,21 +68,21 @@ class Attack:
         batch_size=1,
         l2penalty=float("inf"),
     ):
+        assert max_audio_length % Attack.noise_length == 0
+
         # Basic information for building inference graph
         self.batch_size = batch_size
         self.max_target_phrase_length = max_target_phrase_length
         self.max_audio_length = max_audio_length
 
-        # Variables
-        with tfv1.variable_scope("adv", reuse=tfv1.AUTO_REUSE):
-            self.delta = tf.Variable(
-                tf.zeros(max_audio_length, dtype=tf.float32), name="delta"
-            )
-            self.rescale = tf.Variable(tf.ones((1,), dtype=tf.float32), name="rescale")
-            self.lr = tf.Variable(1e2, shape=(), name="lr")
-            self.global_step = tf.Variable(0, dtype=tf.int32, name="global_step")
-
         # Placeholder for inputs
+        # self.seed = tfv1.placeholder(
+        #     shape=(batch_size, Attack.deconv_depths[0], Attack.deconv_channels[0]), dtype=tf.float32
+        # )
+        self.seed = tf.random.uniform(
+            shape=(batch_size, 250, 64),
+            dtype=tf.float32,
+        )
         self.mask = tfv1.placeholder(
             shape=(batch_size, max_audio_length), dtype=tf.bool
         )
@@ -55,12 +97,62 @@ class Attack:
             shape=(batch_size,), dtype=tf.int32
         )
 
+        # Variables
+        self.gen = keras.Sequential(
+            [
+                Conv1DTranspose(128, 3, 2),
+                keras.layers.LeakyReLU(),
+                keras.layers.BatchNormalization(axis=2),
+                Conv1DTranspose(128, 3, 2),
+                keras.layers.LeakyReLU(),
+                keras.layers.BatchNormalization(axis=2),
+                Conv1DTranspose(128, 3, 2),
+                keras.layers.LeakyReLU(),
+                keras.layers.BatchNormalization(axis=2),
+                Conv1DTranspose(128, 3, 2),
+                keras.layers.LeakyReLU(),
+                keras.layers.BatchNormalization(axis=2),
+                Conv1DTranspose(128, 3, 2),
+                keras.layers.LeakyReLU(),
+                keras.layers.BatchNormalization(axis=2),
+                Conv1DTranspose(1, 3, 2, activation="sigmoid"),
+                keras.layers.Reshape((16000,)),
+            ]
+        )
+        self.dis = keras.Sequential(
+            [
+                keras.layers.InputLayer((16000,)),
+                keras.layers.Reshape((16000, 1)),
+                keras.layers.Conv1D(64, 3, strides=4, activation="relu"),
+                keras.layers.BatchNormalization(),
+                keras.layers.Conv1D(128, 3, strides=4, activation="relu"),
+                keras.layers.BatchNormalization(),
+                keras.layers.Conv1D(128, 3, strides=4, activation="relu"),
+                keras.layers.BatchNormalization(),
+                keras.layers.Conv1D(128, 3, strides=4, activation="relu"),
+                keras.layers.BatchNormalization(),
+                keras.layers.Flatten(),
+                keras.layers.Dense(128, "relu"),
+                keras.layers.Dense(1, "sigmoid"),
+            ]
+        )
+        with tfv1.variable_scope("train", reuse=tfv1.AUTO_REUSE):
+            self.rescale = tf.Variable(
+                tf.constant(2000.0, dtype=tf.float32), name="rescale"
+            )
+            self.lr = tf.Variable(1e2, shape=(), name="lr")
+            self.global_step = tf.Variable(0, dtype=tf.int32, name="global_step")
+
         # Prepare input audios
+        self.delta = self.gen(self.seed) * self.rescale
+
         offset = tf.random.uniform(
             (), minval=0, maxval=max_audio_length, dtype=tf.int32
         )
         apply_delta = tf.concat((self.delta[offset:], self.delta[:offset]), axis=0)
-        apply_delta = tf.clip_by_value(apply_delta, -2000, 2000)
+        apply_delta = tf.repeat(
+            apply_delta, self.max_audio_length // Attack.noise_length, axis=0
+        )
         apply_delta = apply_delta * self.rescale * tf.cast(self.mask, tf.float32)
         noise = tf.random.normal((batch_size, max_audio_length), stddev=2)
         self.noised_audio = tf.clip_by_value(
@@ -95,10 +187,10 @@ class Attack:
         #     decay_steps=10, decay_rate=2)
         self.optimizer = tfv1.train.AdamOptimizer(self.lr)
         self.train_pos_op = self.optimizer.minimize(
-            self.loss, global_step=self.global_step, var_list=[self.delta]
+            self.loss, global_step=self.global_step, var_list=self.gen.variables
         )
         self.train_neg_op = self.optimizer.minimize(
-            -self.loss, global_step=self.global_step, var_list=[self.delta]
+            -self.loss, global_step=self.global_step, var_list=self.gen.variables
         )
 
         delta_loudness = tfv1.summary.scalar(
@@ -110,28 +202,39 @@ class Attack:
         self.pos_summary = tfv1.summary.merge(
             [
                 tfv1.summary.scalar("pos_loss", tf.math.reduce_mean(self.loss)),
-                delta_loudness
+                delta_loudness,
             ]
         )
         self.neg_summary = tfv1.summary.merge(
             [
                 tfv1.summary.scalar("neg_loss", tf.math.reduce_mean(self.loss)),
-                delta_loudness
+                delta_loudness,
             ]
         )
 
-    def init_sess(self, sess, restore_path=None):
-        saver = tfv1.train.Saver(
-            set(tfv1.global_variables()) - set(tfv1.global_variables("adv"))
+    def variables(self):
+        return (
+            self.gen.variables
+            + self.dis.variables
+            + tfv1.global_variables("train")
         )
+
+    def init_sess(self, sess, restore_path=None):
+        saver = tfv1.train.Saver(set(tfv1.global_variables()) - set(self.variables()) - set(tfv1.global_variables('sequential')))
         saver.restore(sess, restore_path)
 
         sess.run(
-            tfv1.variables_initializer(
-                self.optimizer.variables() + tf.global_variables("adv")
-            )
+            tfv1.variables_initializer(self.optimizer.variables() + self.variables())
         )
         sess.run(self.global_step.assign(0))
+
+    def save_model(self, sess, path):
+        saver = tfv1.train.Saver(self.variables())
+        saver.save(sess, path)
+
+    def restore_model(self, sess, path):
+        saver = tfv1.train.Saver(self.variables())
+        saver.restore(sess, path)
 
     def build_feed_dict(self, audios, lengths, target=None):
         assert audios.shape[0] == self.batch_size
