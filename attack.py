@@ -218,6 +218,12 @@ class Attack:
             + self.dis.variables
             + tfv1.global_variables("train")
         )
+    def trainable_variables(self):
+        return (
+            self.gen.trainable_variables
+            + self.dis.trainable_variables
+            + tfv1.global_variables("train")
+        )
 
     def init_sess(self, sess, restore_path=None):
         saver = tfv1.train.Saver(set(tfv1.global_variables()) - set(self.variables()) - set(tfv1.global_variables('sequential')))
@@ -229,11 +235,11 @@ class Attack:
         sess.run(self.global_step.assign(0))
 
     def save_model(self, sess, path):
-        saver = tfv1.train.Saver(self.variables())
+        saver = tfv1.train.Saver(self.trainable_variables())
         saver.save(sess, path)
 
     def restore_model(self, sess, path):
-        saver = tfv1.train.Saver(self.variables())
+        saver = tfv1.train.Saver(self.trainable_variables())
         saver.restore(sess, path)
 
     def build_feed_dict(self, audios, lengths, target=None):
